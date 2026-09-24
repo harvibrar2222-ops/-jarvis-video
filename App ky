@@ -1,0 +1,196 @@
+"""
+Jarvis Video (standalone): researches a topic on the web, writes a scene script,
+and produces a narrated explainer video (MP4).
+
+Pipeline: web research (Claude) -> script.json -> slides (Pillow)
+          -> voiceover (gTTS) -> scene clips + final.mp4 (ffmpeg)
+
+Setup:
+    pip install anthropic pillow gtts
+    Install ffmpeg:  brew install ffmpeg  |  sudo apt install ffmpeg  |  ffmpeg.org
+    Set your key:    export ANTHROPIC_API_KEY="your_api_key_here"
+                     (Windows PowerShell: $env:ANTHROPIC_API_KEY="your_api_key_here")
+
+Run:
+    python jarvis_video.py "How black holes work"
+    python jarvis_video.py            # asks for a topic
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+import anthropic
+from gtts import gTTS
+from PIL import Image, ImageDraw, ImageFont
+
+MODEL = "claude-sonnet-5"
+MAX_TURNS = 8  # safety cap on research loop
+W, H = 1280, 720
+BG, FG, ACCENT, MUTED = (16, 22, 38), (240, 244, 255), (99, 179, 237), (150, 165, 190)
+
+RESEARCH_PROMPT = """You are Jarvis, a research agent. For the user's topic:
+1. Search the web several times from different angles.
+2. Prefer primary and reputable sources; note when sources disagree.
+3. Reply with: a short overview, the main ideas in a logical teaching order,
+   4-6 key facts, and a list of sources (title + URL).
+Paraphrase in your own words. Be clear about anything uncertain."""
+
+SCRIPT_PROMPT = """You are Jarvis. Turn the research into a short explainer video script.
+Reply with ONLY valid JSON, no markdown fences, in this shape:
+{"title": "...",
+ "scenes": [{"heading": "...", "bullets": ["...", "..."], "narration": "..."}],
+ "sources": [{"title": "...", "url": "..."}]}
+Rules: 5 to 7 scenes. First scene is an intro, last is a recap. Headings under 6 words.
+2-3 bullets per scene, each under 10 words. Narration is 1-3 spoken sentences,
+plain and conversational, in your own words. Only list sources that appear in the research."""
+
+TOOLS = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}]
+
+
+# ---------- checks ----------
+
+def preflight() -> anthropic.Anthropic:
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise RuntimeError("Missing ANTHROPIC_API_KEY. Add your key first.")
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg not found. Install it (brew install ffmpeg / sudo apt install ffmpeg).")
+    return anthropic.Anthropic()
+
+
+# ---------- research and script ----------
+
+def research(client, topic: str) -> str:
+    messages = [{"role": "user", "content": f"Research this topic: {topic}"}]
+    for _ in range(MAX_TURNS):
+        resp = client.messages.create(
+            model=MODEL, max_tokens=2000, system=RESEARCH_PROMPT,
+            tools=TOOLS, messages=messages,
+        )
+        if resp.stop_reason == "pause_turn":  # long search turn; continue
+            messages.append({"role": "assistant", "content": resp.content})
+            continue
+        return "".join(b.text for b in resp.content if b.type == "text")
+    return "Research hit the turn limit; use what is known so far."
+
+
+def write_script(client, topic: str, findings: str) -> dict:
+    for attempt in range(2):
+        resp = client.messages.create(
+            model=MODEL, max_tokens=3000, system=SCRIPT_PROMPT,
+            messages=[{"role": "user", "content": f"Topic: {topic}\n\nResearch:\n{findings}"}],
+        )
+        raw = "".join(b.text for b in resp.content if b.type == "text")
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+        try:
+            script = json.loads(raw)
+            if script.get("scenes"):
+                return script
+        except json.JSONDecodeError:
+            pass
+        print("Script was not valid JSON, retrying...")
+    raise RuntimeError("Could not get a valid script from Claude. Try again.")
+
+
+# ---------- slides, audio, video ----------
+
+def font(size, bold=False):
+    names = ["DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+             "Arial Bold.ttf" if bold else "Arial.ttf", "arialbd.ttf" if bold else "arial.ttf"]
+    for name in names:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def draw_slide(scene: dict, index: int, total: int, path: Path) -> None:
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, 16, H], fill=ACCENT)
+
+    y = 80
+    for line in textwrap.wrap(scene["heading"], width=28)[:2]:
+        d.text((90, y), line, font=font(60, True), fill=FG)
+        y += 74
+    d.rectangle([90, y + 10, 290, y + 16], fill=ACCENT)
+
+    y += 60
+    for bullet in scene.get("bullets", [])[:3]:
+        lines = textwrap.wrap(bullet, width=46)
+        d.ellipse([92, y + 14, 106, y + 28], fill=ACCENT)
+        for line in lines:
+            d.text((130, y), line, font=font(38), fill=FG)
+            y += 52
+        y += 22
+
+    d.text((90, H - 60), f"Jarvis  |  {index}/{total}", font=font(24), fill=MUTED)
+    img.save(path)
+
+
+def ffmpeg(args: list) -> None:
+    result = subprocess.run(["ffmpeg", "-y", *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed:\n{result.stderr[-800:]}")
+
+
+def make_video(topic: str, progress=lambda msg, frac: print(msg)):
+    """Returns (path_to_final_mp4, script_dict)."""
+    client = preflight()
+
+    progress("Researching the web...", 0.05)
+    findings = research(client, topic)
+
+    progress("Writing the script...", 0.25)
+    script = write_script(client, topic, findings)
+    scenes = script["scenes"]
+
+    slug = re.sub(r"[^a-z0-9]+", "-", topic.lower()).strip("-")[:40] or "video"
+    out = Path(f"jarvis-video-{slug}")
+    out.mkdir(exist_ok=True)
+    (out / "script.json").write_text(json.dumps(script, indent=2), encoding="utf-8")
+
+    clips = []
+    for i, scene in enumerate(scenes, 1):
+        tag = f"scene_{i:02d}"
+        png, mp3, mp4 = out / f"{tag}.png", out / f"{tag}.mp3", out / f"{tag}.mp4"
+        progress(f"Building scene {i}/{len(scenes)}: {scene['heading']}", 0.35 + 0.55 * (i - 1) / len(scenes))
+        draw_slide(scene, i, len(scenes), png)
+        gTTS(scene["narration"], lang="en").save(str(mp3))
+        ffmpeg([
+            "-loop", "1", "-i", str(png), "-i", str(mp3),
+            "-c:v", "libx264", "-tune", "stillimage", "-r", "30", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-ar", "44100", "-ac", "2", "-shortest", str(mp4),
+        ])
+        clips.append(mp4)
+
+    progress("Stitching final video...", 0.95)
+    listing = out / "clips.txt"
+    listing.write_text("".join(f"file '{c.name}'\n" for c in clips), encoding="utf-8")
+    final = out / "final.mp4"
+    ffmpeg(["-f", "concat", "-safe", "0", "-i", str(listing), "-c", "copy", str(final)])
+
+    progress("Done", 1.0)
+    return final.resolve(), script
+
+
+if __name__ == "__main__":
+    topic = " ".join(sys.argv[1:]).strip() or input("Video topic> ").strip()
+    if not topic:
+        sys.exit("No topic given.")
+    try:
+        final, script = make_video(topic)
+    except RuntimeError as err:
+        sys.exit(str(err))
+    print(f"\nDone: {final}")
+    for src in script.get("sources", []):
+        print(f"  - {src.get('title', '')} {src.get('url', '')}")
